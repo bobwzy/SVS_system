@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 # !/usr/bin/env python3
-
+from pathlib import Path
 
 import copy
 import librosa
@@ -30,7 +30,7 @@ import torch
 
 # from SVS.model.layers.utterance_mvn import UtteranceMVN
 # from pathlib import Path
-
+# from SVS.model.network import WaveRNN
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -40,21 +40,34 @@ def collect_stats(train_loader, args):
     print("get in collect stats", flush=True)
     count, sum, sum_square = 0, 0, 0
     count_mel, sum_mel, sum_square_mel = 0, 0, 0
-    for (
-        step,
-        (
-            phone,
-            beat,
-            pitch,
-            spec,
-            real,
-            imag,
-            length,
-            chars,
-            char_len_list,
-            mel,
-        ),
-    ) in enumerate(train_loader, 1):
+    for (step, data_step) in enumerate(train_loader, 1):
+        if args.db_joint:
+            (
+                phone,
+                beat,
+                pitch,
+                spec,
+                real,
+                imag,
+                length,
+                chars,
+                char_len_list,
+                mel,
+                singer_id,
+            ) = data_step
+        else:
+            (
+                phone,
+                beat,
+                pitch,
+                spec,
+                real,
+                imag,
+                length,
+                chars,
+                char_len_list,
+                mel,
+            ) = data_step
         # print(f"spec.shape: {spec.shape},length.shape:
         # {length.shape}, mel.shape: {mel.shape}")
         for i, seq in enumerate(spec.cpu().numpy()):
@@ -80,17 +93,9 @@ def collect_stats(train_loader, args):
     for name in dirnames:
         if not os.path.exists(name):
             os.makedirs(name)
+    np.savez(args.stats_file, count=count, sum=sum, sum_square=sum_square)
     np.savez(
-        args.stats_file,
-        count=count,
-        sum=sum,
-        sum_square=sum_square,
-    )
-    np.savez(
-        args.stats_mel_file,
-        count=count_mel,
-        sum=sum_mel,
-        sum_square=sum_square_mel,
+        args.stats_mel_file, count=count_mel, sum=sum_mel, sum_square=sum_square_mel
     )
 
 
@@ -103,6 +108,7 @@ def train_one_epoch(
     perceptual_entropy,
     epoch,
     args,
+    voc_model,
 ):
     """train_one_epoch."""
     losses = AverageMeter()
@@ -129,21 +135,43 @@ def train_one_epoch(
     # f0_ground_truth_all = np.reshape(np.array([]), (-1, 1))
     # f0_synthesis_all = np.reshape(np.array([]), (-1, 1))
 
-    for (
-        step,
-        (
-            phone,
-            beat,
-            pitch,
-            spec,
-            real,
-            imag,
-            length,
-            chars,
-            char_len_list,
-            mel,
-        ),
-    ) in enumerate(train_loader, 1):
+    for (step, data_step) in enumerate(train_loader, 1):
+        if args.db_joint:
+            (
+                phone,
+                beat,
+                pitch,
+                spec,
+                real,
+                imag,
+                length,
+                chars,
+                char_len_list,
+                mel,
+                singer_id,
+            ) = data_step
+
+            singer_id = np.array(singer_id).reshape(
+                np.shape(phone)[0], -1
+            )  # [batch size, 1]
+            singer_vec = singer_id.repeat(
+                np.shape(phone)[1], axis=1
+            )  # [batch size, length]
+            singer_vec = torch.from_numpy(singer_vec).to(device)
+
+        else:
+            (
+                phone,
+                beat,
+                pitch,
+                spec,
+                real,
+                imag,
+                length,
+                chars,
+                char_len_list,
+                mel,
+            ) = data_step
         phone = phone.to(device)
         beat = beat.to(device)
         pitch = pitch.to(device).float()
@@ -170,51 +198,56 @@ def train_one_epoch(
         # output = [batch size, num frames, feat_dim]
         # output_mel = [batch size, num frames, n_mels dimension]
         if args.model_type == "GLU_Transformer":
-            output, att, output_mel, output_mel2 = model(
-                chars,
-                phone,
-                pitch,
-                beat,
-                pos_char=char_len_list,
-                pos_spec=length,
-            )
+            if args.db_joint:
+                output, att, output_mel, output_mel2 = model(
+                    chars,
+                    phone,
+                    pitch,
+                    beat,
+                    singer_vec,
+                    pos_char=char_len_list,
+                    pos_spec=length,
+                )
+            else:
+                output, att, output_mel, output_mel2 = model(
+                    chars, phone, pitch, beat, pos_char=char_len_list, pos_spec=length
+                )
         elif args.model_type == "LSTM":
-            output, hidden, output_mel, output_mel2 = model(phone, pitch, beat)
+            if args.db_joint:
+                output, hidden, output_mel, output_mel2 = model(
+                    phone, pitch, beat, singer_vec
+                )
+            else:
+                output, hidden, output_mel, output_mel2 = model(phone, pitch, beat)
             att = None
         elif args.model_type == "GRU_gs":
-            output, att, output_mel = model(
-                spec, phone, pitch, beat, length, args
-            )
+            output, att, output_mel = model(spec, phone, pitch, beat, length, args)
             att = None
         elif args.model_type == "PureTransformer":
             output, att, output_mel, output_mel2 = model(
-                chars,
-                phone,
-                pitch,
-                beat,
-                pos_char=char_len_list,
-                pos_spec=length,
+                chars, phone, pitch, beat, pos_char=char_len_list, pos_spec=length
             )
         elif args.model_type == "Conformer":
             # print(f"chars: {np.shape(chars)}, phone:
             # {np.shape(phone)}, length: {np.shape(length)}")
             output, att, output_mel, output_mel2 = model(
-                chars,
-                phone,
-                pitch,
-                beat,
-                pos_char=char_len_list,
-                pos_spec=length,
+                chars, phone, pitch, beat, pos_char=char_len_list, pos_spec=length
             )
         elif args.model_type == "Comformer_full":
-            output, att, output_mel, output_mel2 = model(
-                chars,
-                phone,
-                pitch,
-                beat,
-                pos_char=char_len_list,
-                pos_spec=length,
-            )
+            if args.db_joint:
+                output, att, output_mel, output_mel2 = model(
+                    chars,
+                    phone,
+                    pitch,
+                    beat,
+                    singer_vec,
+                    pos_char=char_len_list,
+                    pos_spec=length,
+                )
+            else:
+                output, att, output_mel, output_mel2 = model(
+                    chars, phone, pitch, beat, pos_char=char_len_list, pos_spec=length
+                )
         elif args.model_type == "USTC_DAR":
             output_mel = model(
                 phone, pitch, beat, length, args
@@ -226,6 +259,7 @@ def train_one_epoch(
         if args.normalize:
             sepc_normalizer = GlobalMVN(args.stats_file)
             mel_normalizer = GlobalMVN(args.stats_mel_file)
+            output_mel_normalizer = GlobalMVN(args.stats_mel_file)
             spec, _ = sepc_normalizer(spec, length)
             mel, _ = mel_normalizer(mel, length)
 
@@ -243,14 +277,14 @@ def train_one_epoch(
         else:
             mel_loss = 0
             double_mel_loss = 0
-
-        train_loss = mel_loss + double_mel_loss + spec_loss
-
+        if args.vocoder_category == "wavernn":
+            train_loss = mel_loss + double_mel_loss
+        else:
+            train_loss = mel_loss + double_mel_loss + spec_loss
         if args.perceptual_loss > 0:
             pe_loss = perceptual_entropy(output, real, imag)
             final_loss = (
-                args.perceptual_loss * pe_loss
-                + (1 - args.perceptual_loss) * train_loss
+                args.perceptual_loss * pe_loss + (1 - args.perceptual_loss) * train_loss
             )
         else:
             final_loss = train_loss
@@ -287,31 +321,41 @@ def train_one_epoch(
                 # normalize inverse 只在infer的时候用，因为log过程需要转换成wav,和计算mcd等指标
                 if args.normalize and args.stats_file:
                     output_mel, _ = mel_normalizer.inverse(output_mel, length)
+                    mel, _ = mel_normalizer.inverse(mel, length)
+                    output_mel = output_mel_normalizer.inverse(output_mel, length)
                 log_figure_mel(
-                    step,
-                    output_mel,
-                    mel_origin,
-                    att,
-                    length,
-                    log_save_dir,
-                    args,
+                    step, output_mel, mel_origin, att, length, log_save_dir, args
                 )
-                out_log = (
-                    "step {}: train_loss {:.4f}; spec_loss {:.4f};".format(
-                        step, losses.avg, spec_losses.avg
-                    )
+                out_log = "step {}: train_loss {:.4f}; spec_loss {:.4f};".format(
+                    step, losses.avg, spec_losses.avg
                 )
             else:
                 # normalize inverse 只在infer的时候用，因为log过程需要转换成wav,和计算mcd等指标
                 if args.normalize and args.stats_file:
                     output, _ = sepc_normalizer.inverse(output, length)
-                log_figure(
-                    step, output, spec_origin, att, length, log_save_dir, args
-                )
-                out_log = (
-                    "step {}: train_loss {:.4f}; spec_loss {:.4f};".format(
-                        step, losses.avg, spec_losses.avg
+                    mel, _ = mel_normalizer.inverse(mel, length)
+                    output_mel = output_mel_normalizer.inverse(output_mel, length)
+
+                if args.vocoder_category == "wavernn":
+                    for i in range(output_mel[0].shape[0]):
+                        one_batch_output_mel = output_mel[0][i].unsqueeze(0)
+                        one_batch_mel = mel[i].unsqueeze(0)
+                        log_mel(
+                            step,
+                            one_batch_output_mel,
+                            one_batch_mel,
+                            att,
+                            length,
+                            log_save_dir,
+                            args,
+                            voc_model,
+                        )
+                else:
+                    log_figure(
+                        step, output, spec_origin, att, length, log_save_dir, args
                     )
+                out_log = "step {}: train_loss {:.4f}; spec_loss {:.4f};".format(
+                    step, losses.avg, spec_losses.avg
                 )
 
             if args.perceptual_loss > 0:
@@ -319,9 +363,7 @@ def train_one_epoch(
             if args.n_mels > 0:
                 out_log += "mel_loss {:.4f}; ".format(mel_losses.avg)
                 if args.double_mel_loss:
-                    out_log += "dmel_loss {:.4f}; ".format(
-                        double_mel_losses.avg
-                    )
+                    out_log += "dmel_loss {:.4f}; ".format(double_mel_losses.avg)
             print("{} -- sum_time: {:.2f}s".format(out_log, (end - start)))
 
     info = {"loss": losses.avg, "spec_loss": spec_losses.avg}
@@ -333,7 +375,7 @@ def train_one_epoch(
 
 
 def validate(
-    dev_loader, model, device, criterion, perceptual_entropy, epoch, args
+    dev_loader, model, device, criterion, perceptual_entropy, epoch, args, voc_model
 ):
     """validate."""
     losses = AverageMeter()
@@ -356,21 +398,44 @@ def validate(
     start = time.time()
 
     with torch.no_grad():
-        for (
-            step,
-            (
-                phone,
-                beat,
-                pitch,
-                spec,
-                real,
-                imag,
-                length,
-                chars,
-                char_len_list,
-                mel,
-            ),
-        ) in enumerate(dev_loader, 1):
+        for (step, data_step) in enumerate(dev_loader, 1):
+            if args.db_joint:
+                (
+                    phone,
+                    beat,
+                    pitch,
+                    spec,
+                    real,
+                    imag,
+                    length,
+                    chars,
+                    char_len_list,
+                    mel,
+                    singer_id,
+                ) = data_step
+
+                singer_id = np.array(singer_id).reshape(
+                    np.shape(phone)[0], -1
+                )  # [batch size, 1]
+                singer_vec = singer_id.repeat(
+                    np.shape(phone)[1], axis=1
+                )  # [batch size, length]
+                singer_vec = torch.from_numpy(singer_vec).to(device)
+
+            else:
+                (
+                    phone,
+                    beat,
+                    pitch,
+                    spec,
+                    real,
+                    imag,
+                    length,
+                    chars,
+                    char_len_list,
+                    mel,
+                ) = data_step
+
             phone = phone.to(device)
             beat = beat.to(device)
             pitch = pitch.to(device).float()
@@ -381,9 +446,7 @@ def validate(
             imag = imag.to(device).float()
             length_mask = length.unsqueeze(2)
             if mel is not None:
-                length_mel_mask = length_mask.repeat(
-                    1, 1, mel.shape[2]
-                ).float()
+                length_mel_mask = length_mask.repeat(1, 1, mel.shape[2]).float()
                 length_mel_mask = length_mel_mask.to(device)
             length_mask = length_mask.repeat(1, 1, spec.shape[2]).float()
             length_mask = length_mask.to(device)
@@ -396,51 +459,65 @@ def validate(
                 phone = phone.float()
 
             if args.model_type == "GLU_Transformer":
-                output, att, output_mel, output_mel2 = model(
-                    chars,
-                    phone,
-                    pitch,
-                    beat,
-                    pos_char=char_len_list,
-                    pos_spec=length,
-                )
+                if args.db_joint:
+                    output, att, output_mel, output_mel2 = model(
+                        chars,
+                        phone,
+                        pitch,
+                        beat,
+                        singer_vec,
+                        pos_char=char_len_list,
+                        pos_spec=length,
+                    )
+                else:
+                    output, att, output_mel, output_mel2 = model(
+                        chars,
+                        phone,
+                        pitch,
+                        beat,
+                        pos_char=char_len_list,
+                        pos_spec=length,
+                    )
             elif args.model_type == "LSTM":
-                output, hidden, output_mel, output_mel2 = model(
-                    phone, pitch, beat
-                )
+                if args.db_joint:
+                    output, hidden, output_mel, output_mel2 = model(
+                        phone, pitch, beat, singer_vec
+                    )
+                else:
+                    output, hidden, output_mel, output_mel2 = model(phone, pitch, beat)
                 att = None
+
             elif args.model_type == "GRU_gs":
-                output, att, output_mel = model(
-                    spec, phone, pitch, beat, length, args
-                )
+                output, att, output_mel = model(spec, phone, pitch, beat, length, args)
                 att = None
             elif args.model_type == "PureTransformer":
                 output, att, output_mel, output_mel2 = model(
-                    chars,
-                    phone,
-                    pitch,
-                    beat,
-                    pos_char=char_len_list,
-                    pos_spec=length,
+                    chars, phone, pitch, beat, pos_char=char_len_list, pos_spec=length
                 )
             elif args.model_type == "Conformer":
                 output, att, output_mel, output_mel2 = model(
-                    chars,
-                    phone,
-                    pitch,
-                    beat,
-                    pos_char=char_len_list,
-                    pos_spec=length,
+                    chars, phone, pitch, beat, pos_char=char_len_list, pos_spec=length
                 )
             elif args.model_type == "Comformer_full":
-                output, att, output_mel, output_mel2 = model(
-                    chars,
-                    phone,
-                    pitch,
-                    beat,
-                    pos_char=char_len_list,
-                    pos_spec=length,
-                )
+                if args.db_joint:
+                    output, att, output_mel, output_mel2 = model(
+                        chars,
+                        phone,
+                        pitch,
+                        beat,
+                        singer_vec,
+                        pos_char=char_len_list,
+                        pos_spec=length,
+                    )
+                else:
+                    output, att, output_mel, output_mel2 = model(
+                        chars,
+                        phone,
+                        pitch,
+                        beat,
+                        pos_char=char_len_list,
+                        pos_spec=length,
+                    )
             elif args.model_type == "USTC_DAR":
                 output_mel = model(phone, pitch, beat, length, args)
                 att = None
@@ -450,6 +527,7 @@ def validate(
             if args.normalize:
                 sepc_normalizer = GlobalMVN(args.stats_file)
                 mel_normalizer = GlobalMVN(args.stats_mel_file)
+                output_mel_normalizer = GlobalMVN(args.stats_mel_file)
                 spec, _ = sepc_normalizer(spec, length)
                 mel, _ = mel_normalizer(mel, length)
 
@@ -462,16 +540,17 @@ def validate(
                 mel_loss = criterion(output_mel, mel, length_mel_mask)
 
                 if args.double_mel_loss:
-                    double_mel_loss = criterion(
-                        output_mel2, mel, length_mel_mask
-                    )
+                    double_mel_loss = criterion(output_mel2, mel, length_mel_mask)
                 else:
                     double_mel_loss = 0
             else:
                 mel_loss = 0
                 double_mel_loss = 0
 
-            dev_loss = mel_loss + double_mel_loss + spec_loss
+            if args.vocoder_category == "wavernn":
+                dev_loss = mel_loss + double_mel_loss
+            else:
+                dev_loss = mel_loss + double_mel_loss + spec_loss
 
             if args.perceptual_loss > 0:
                 pe_loss = perceptual_entropy(output, real, imag)
@@ -492,14 +571,14 @@ def validate(
             if args.n_mels > 0:
                 mel_losses.update(mel_loss.item(), phone.size(0))
                 if args.double_mel_loss:
-                    double_mel_losses.update(
-                        double_mel_loss.item(), phone.size(0)
-                    )
+                    double_mel_losses.update(double_mel_loss.item(), phone.size(0))
 
             if args.model_type == "USTC_DAR":
                 # normalize inverse stage
                 if args.normalize and args.stats_file:
-                    output_mel, _ = mel_normalizer.inverse(output_mel, length)
+                    # output_mel, _ = mel_normalizer.inverse(output_mel, length)
+                    mel, _ = mel_normalizer.inverse(mel, length)
+                    output_mel, _ = output_mel_normalizer.inverse(output_mel, length)
                 mcd_value, length_sum = (
                     0,
                     1,
@@ -508,10 +587,10 @@ def validate(
                 # normalize inverse stage
                 if args.normalize and args.stats_file:
                     output, _ = sepc_normalizer.inverse(output, length)
-                (
-                    mcd_value,
-                    length_sum,
-                ) = Metrics.Calculate_melcd_fromLinearSpectrum(
+                    # output_mel, _ = mel_normalizer.inverse(output_mel, length)
+                    mel, _ = mel_normalizer.inverse(mel, length)
+                    output_mel, _ = output_mel_normalizer.inverse(output_mel, length)
+                (mcd_value, length_sum) = Metrics.Calculate_melcd_fromLinearSpectrum(
                     output, spec_origin, length, args
                 )
             mcd_metric.update(mcd_value, length_sum)
@@ -519,24 +598,27 @@ def validate(
             if step % args.dev_step_log == 0:
                 if args.model_type == "USTC_DAR":
                     log_figure_mel(
-                        step,
-                        output_mel,
-                        mel_origin,
-                        att,
-                        length,
-                        log_save_dir,
-                        args,
+                        step, output_mel, mel_origin, att, length, log_save_dir, args
                     )
                 else:
-                    log_figure(
-                        step,
-                        output,
-                        spec_origin,
-                        att,
-                        length,
-                        log_save_dir,
-                        args,
-                    )
+                    if args.vocoder_category == "wavernn":
+                        for i in range(output_mel.shape[0]):
+                            one_batch_output_mel = output_mel[i].unsqueeze(0)
+                            one_batch_mel = mel[i].unsqueeze(0)
+                            log_mel(
+                                step,
+                                one_batch_output_mel,
+                                one_batch_mel,
+                                att,
+                                length,
+                                log_save_dir,
+                                args,
+                                voc_model,
+                            )
+                    else:
+                        log_figure(
+                            step, output, spec_origin, att, length, log_save_dir, args
+                        )
                 out_log = (
                     "step {}: train_loss {:.4f}; "
                     "spec_loss {:.4f}; mcd_value {:.4f};".format(
@@ -548,9 +630,7 @@ def validate(
                 if args.n_mels > 0:
                     out_log += "mel_loss {:.4f}; ".format(mel_losses.avg)
                     if args.double_mel_loss:
-                        out_log += "dmel_loss {:.4f}; ".format(
-                            double_mel_losses.avg
-                        )
+                        out_log += "dmel_loss {:.4f}; ".format(double_mel_losses.avg)
                 end = time.time()
                 print("{} -- sum_time: {}s".format(out_log, (end - start)))
 
@@ -595,14 +675,7 @@ def save_checkpoint(state, model_filename):
 
 
 def save_model(
-    args,
-    epoch,
-    model,
-    optimizer,
-    train_info,
-    dev_info,
-    logger,
-    save_loss_select,
+    args, epoch, model, optimizer, train_info, dev_info, logger, save_loss_select
 ):
     """save_model."""
     if args.optimizer == "noam":
@@ -618,10 +691,7 @@ def save_model(
         )
     else:
         save_checkpoint(
-            {
-                "epoch": epoch,
-                "state_dict": model.state_dict(),
-            },
+            {"epoch": epoch, "state_dict": model.state_dict()},
             "{}/epoch_{}_{}.pth.tar".format(
                 args.model_save_dir, save_loss_select, epoch
             ),
@@ -634,10 +704,7 @@ def save_model(
 
 def record_info(train_info, dev_info, epoch, logger):
     """record_info."""
-    loss_info = {
-        "train_loss": train_info["loss"],
-        "dev_loss": dev_info["loss"],
-    }
+    loss_info = {"train_loss": train_info["loss"], "dev_loss": dev_info["loss"]}
     logger.add_scalars("losses", loss_info, epoch)
     return 0
 
@@ -649,9 +716,7 @@ def invert_spectrogram(spectrogram, win_length, hop_length):
     Args:
       spectrogram: [1+n_fft//2, t]
     """
-    return librosa.istft(
-        spectrogram, hop_length, win_length=win_length, window="hann"
-    )
+    return librosa.istft(spectrogram, hop_length, win_length=win_length, window="hann")
 
 
 def griffin_lim(spectrogram, iter_vocoder, n_fft, hop_length, win_length):
@@ -788,9 +853,7 @@ def log_figure(step, output, spec, att, length, save_dir, args):
 
     if librosa.__version__ < "0.8.0":
         librosa.output.write_wav(
-            os.path.join(save_dir, "{}.wav".format(step)),
-            wav,
-            args.sampling_rate,
+            os.path.join(save_dir, "{}.wav".format(step)), wav, args.sampling_rate
         )
         librosa.output.write_wav(
             os.path.join(save_dir, "{}_true.wav".format(step)),
@@ -835,13 +898,87 @@ def log_figure(step, output, spec, att, length, save_dir, args):
         plt.savefig(os.path.join(save_dir, "{}_att.png".format(step)))
 
 
+def log_mel(step, output_mel, ori_mel, att, length, save_dir, args, voc_model):
+    """log_mel."""
+    # only get one sample from a batch
+    # save wav and plot spectrogram
+    save_dir = Path(save_dir).expanduser()
+    length = np.max(length.cpu().detach().numpy()[0])
+    # output_mel = output_mel[:length]
+    # mel = mel[:length]
+
+    output_mel = output_mel.cpu().detach().numpy()[0]
+    output_mel = output_mel[:length]
+    output_mel = output_mel.transpose(1, 0)
+    output_mel = torch.tensor(output_mel).unsqueeze(0)
+
+    # ori_mel = ori_mel.cpu().detach().numpy()[0]
+    # ori_mel = ori_mel.transpose(1, 0)
+    # ori_mel = torch.tensor(ori_mel).unsqueeze(0)
+
+    ori_mel = ori_mel[:, :length, :]
+    ori_mel = ori_mel.transpose(1, 2)
+
+    wav = voc_model.generate(output_mel, save_dir, False, 11000, 550, True)
+    wav_true = voc_model.generate(ori_mel, save_dir, False, 11000, 550, True)
+
+    if librosa.__version__ < "0.8.0":
+        librosa.output.write_wav(
+            os.path.join(save_dir, "{}.wav".format(step)), wav, args.sampling_rate
+        )
+        librosa.output.write_wav(
+            os.path.join(save_dir, "{}_true.wav".format(step)),
+            wav_true,
+            args.sampling_rate,
+        )
+    else:
+        # librosa > 0.8 remove librosa.output.write_wav module
+        sf.write(
+            os.path.join(save_dir, "{}.wav".format(step)),
+            wav,
+            args.sampling_rate,
+            format="wav",
+            subtype="PCM_24",
+        )
+        sf.write(
+            os.path.join(save_dir, "{}_true.wav".format(step)),
+            wav_true,
+            args.sampling_rate,
+            format="wav",
+            subtype="PCM_24",
+        )
+
+    output_mel = output_mel.squeeze(0)
+    ori_mel = ori_mel.squeeze(0)
+    output_mel = output_mel.cpu().detach().numpy()
+    ori_mel = ori_mel.cpu().detach().numpy()
+
+    plt.subplot(1, 2, 1)
+    specshow(output_mel)
+    plt.title("prediction")
+    plt.subplot(1, 2, 2)
+    specshow(ori_mel)
+    plt.title("ground_truth")
+    plt.savefig(os.path.join(save_dir, "{}.png".format(step)))
+    if att is not None:
+        att = att.cpu().detach().numpy()[0]
+        att = att[:, :length, :length]
+        plt.subplot(1, 4, 1)
+        specshow(att[0])
+        plt.subplot(1, 4, 2)
+        specshow(att[1])
+        plt.subplot(1, 4, 3)
+        specshow(att[2])
+        plt.subplot(1, 4, 4)
+        specshow(att[3])
+        plt.savefig(os.path.join(save_dir, "{}_att.png".format(step)))
+
+
 def Calculate_time(elapsed_time):
     """Calculate_time."""
     elapsed_hours = int(elapsed_time / 3600)
     elapsed_mins = int((elapsed_time - (elapsed_hours * 3600)) / 60)
-    elapsed_secs = int(
-        elapsed_time - (elapsed_hours * 3600) - (elapsed_mins * 60)
-    )
+    elapsed_secs = int(elapsed_time - (elapsed_hours * 3600) - (elapsed_mins * 60))
     return elapsed_hours, elapsed_mins, elapsed_secs
 
 
@@ -878,11 +1015,49 @@ def Calculate_dataset_duration(dataset_path):
     print(f"Time: {hours}h {mins}m {secs}s'")
 
 
+def load_wav(path):
+    """Load wav."""
+    return librosa.load(path, sr=22050)[0]
+
+
+def save_wav(x, path):
+    """Save wav."""
+    librosa.output.write_wav(path, x.astype(np.float32), sr=22050)
+
+
+def melspectrogram(y, n_fft, hop_length, win_length, sr, n_mels):
+    """Melspectrogram."""
+    D = stft(y, n_fft, hop_length, win_length)
+    S = amp_to_db(linear_to_mel(np.abs(D), n_fft, sr, n_mels))
+    return normalize(S)
+
+
+def stft(y, n_fft, hop_length, win_length):
+    """Stft."""
+    return librosa.stft(y=y, n_fft=n_fft, hop_length=hop_length, win_length=win_length)
+
+
+def amp_to_db(x):
+    """Amp to db."""
+    return 20 * np.log10(np.maximum(1e-5, x))
+
+
+def linear_to_mel(spectrogram, n_fft, sr, n_mels):
+    """Linear to mel."""
+    return librosa.feature.melspectrogram(
+        S=spectrogram, sr=sr, n_fft=n_fft, n_mels=n_mels, fmin=40
+    )
+
+
+def normalize(S):
+    """Normalize."""
+    min_level_db = -100
+    return np.clip((S - min_level_db) / -min_level_db, 0, 1)
+
+
 if __name__ == "__main__":
     # path = "/data5/jiatong/SVS_system/SVS/data/
     # public_dataset/kiritan_data/wav_info"
-    path = (
-        "/data5/jiatong/SVS_system/SVS/data/public_dataset/hts_data/wav_info"
-    )
+    path = "/data5/jiatong/SVS_system/SVS/data/public_dataset/hts_data/wav_info"
 
     Calculate_dataset_duration(path)

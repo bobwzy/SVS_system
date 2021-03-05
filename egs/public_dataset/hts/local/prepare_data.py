@@ -22,9 +22,7 @@ def same_split(alignment):
     start = 0
     for i in range(size - 1):
         index = round(len(alignment) / size) * (i + 1)
-        while (
-            index < len(alignment) and alignment[index] != alignment[index + 1]
-        ):
+        while index < len(alignment) and alignment[index] != alignment[index + 1]:
             index += 1
         segments.append(alignment[start:index])
         start = index + 1
@@ -124,10 +122,7 @@ def process(args):
     f0_max = 1100.0
     f0_min = 50.0
 
-    if args.model == "HMM":
-        frame_shift = 10 / 1000
-    elif args.model == "TDNN":
-        frame_shift = 30 / 1000
+    frame_shift = args.shift_size / 1000
 
     hop_length = int(args.sr * frame_shift)
 
@@ -168,9 +163,7 @@ def process(args):
 
         song_align = os.path.join(args.outdir, "alignment")
         song_wav = os.path.join(args.outdir, "wav_info", str(index))
-        song_pitch_beat = os.path.join(
-            args.outdir, "pitch_beat_extraction", str(index)
-        )
+        song_pitch_beat = os.path.join(args.outdir, "pitch_beat_extraction", str(index))
 
         if not os.path.exists(song_align):
             os.makedirs(song_align)
@@ -196,9 +189,7 @@ def process(args):
             # frames = librosa.time_to_frames(
             #     times, sr=args.sr, hop_length=hop_length, n_fft=n_fft
             # )
-            np.save(
-                os.path.join(song_pitch_beat, name) + "_beats", np.array(beats)
-            )
+            np.save(os.path.join(song_pitch_beat, name) + "_beats", np.array(beats))
 
             """extract pitch"""
             seg_signal = seg_signal.astype("double")
@@ -211,9 +202,7 @@ def process(args):
             )
             _f0 = pw.stonemask(seg_signal, _f0, t, args.sr)
 
-            np.save(
-                os.path.join(song_pitch_beat, name) + "_pitch", np.array(_f0)
-            )
+            np.save(os.path.join(song_pitch_beat, name) + "_pitch", np.array(_f0))
 
             alignment_id = np.zeros((len(alignment)))
             for i in range(len(alignment)):
@@ -224,12 +213,15 @@ def process(args):
             )
 
             sf.write(
-                os.path.join(song_wav, name) + ".wav",
-                seg_signal,
-                samplerate=args.sr,
+                os.path.join(song_wav, name) + ".wav", seg_signal, samplerate=args.sr
             )
             print("saved {}".format(os.path.join(song_wav, name) + ".wav"))
         index += 1
+
+    with open(os.path.join(args.outdir, "phone_set.txt"), "w") as f:
+        for p_id, p in enumerate(phone_set):
+            f.write(str(p_id) + " " + p)
+            f.write("\n")
 
 
 if __name__ == "__main__":
@@ -237,7 +229,12 @@ if __name__ == "__main__":
     parser.add_argument("wavdir", type=str, help="wav data directory")
     parser.add_argument("labdir", type=str, help="label data directory")
     parser.add_argument("outdir", type=str, help="output directory")
-    parser.add_argument("--model", type=str, default="TDNN", help="model type")
+    parser.add_argument(
+        "--window_size", type=int, default=60, help="window size in miliseconds"
+    )
+    parser.add_argument(
+        "--shift_size", type=int, default=30, help="shift size in miliseconds"
+    )
     parser.add_argument("--sr", type=int, default=48000)
     parser.add_argument("--sil", type=str, default="pau")
     parser.add_argument(
